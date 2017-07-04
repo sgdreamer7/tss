@@ -1,5 +1,5 @@
 %% @author Владимир Щербина <vns.scherbina@gmail.com>
-%% @copyright 2011 Владимир Щербина
+%% @copyright 2017 Владимир Щербина
 %% @version 1.0.0
 %% @doc Модуль {@module} реализует хранилище временных рядов.
 %% @end
@@ -15,15 +15,17 @@
 
 -export(
 	[
-		store/3,load/4,delete/2,list_series/0,get_last_tick_timestamp/1,
+		store/3,load/4,load_many/4,delete/2,list_series/0,get_last_tick_timestamp/1,
 		get_last_timestamp/2,get_first_timestamp/2,ts2str/1,
 		new_series/0,update_series/2,store_series/1,store_series_parallel/1,
-		export_to_csv/1
+		export_to_csv/3,export_to_csv/1,process_export/2,process_export_serie/5,
+		get_dir_file_prefix/2,
+		export/3
+		% calculate_size/2
 	]
 ).
 
 -include_lib("kernel/include/file.hrl").
-
 
 -define(seriesNamesFileName,"series_names.dat").
 -define(dataDir,"data").
@@ -50,22 +52,19 @@
 	names=gb_sets:empty()
 }).
 
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
--endif.
 %%%%%%%%%%%%%%%%%%%%%%
 %%% public функции %%%
 %%%%%%%%%%%%%%%%%%%%%%
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% @spec ({s,SerieName},{i,SeriePeriod},{matrix,Data}) -> {ok,Status}
+%% @spec (SerieName,SeriePeriod,{m,Data}) -> {ok,Status}
 %% @doc Функция сохранение значений Data серии SerieName с периодом SeriePeriod.
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 store(
-	{s,SerieName},
-	{i,SeriePeriod},
-	{matrix,Data}
+	SerieName,
+	SeriePeriod,
+	{m,Data}
 ) ->
 	case Data of
 		[] ->
@@ -73,63 +72,243 @@ store(
 		[[]] ->
 			ok;
 		_ ->
-			case catch(gen_server:call(?MODULE,{check_file,SerieName,SeriePeriod,true},infinity)) of
+			case catch(check_file(SerieName,SeriePeriod,true)) of
 				{ok,FileName} ->
 					catch(store_data(FileName,SeriePeriod,Data));
 				_ ->
 					error
 			end
 	end,
-    {ok,{s,"Stored."}};
+    {ok,"Stored."};
 store(_,_,_) ->
-	{ok,{s,"Stored."}}.
+	{ok,"Stored."}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% @spec ({s,SerieName},{i,SeriePeriod},Start,Finish) -> {ok,{matrix,Data}}
+%% @spec (SerieName,SeriePeriod,Start,Finish) -> {ok,{m,Data}}
 %% @doc Функция чтения значений серии SerieName с периодом SeriePeriod
 %% на интервале от Start до Finish включительно.
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 load(
-	{s,SerieName},
-	{i,SeriePeriod},
-	{ts,_StartYear,_StartMonth,_StartDay,_StartHour,_StartMinute,_StartSecond}=Start,
-	{ts,_FinishYear,_FinishMonth,_FinishDay,_FinishHour,_FinishMinute,_FinishSecond}=Finish
+	SerieName,
+	SeriePeriod,
+	{ts,StartYear,StartMonth,StartDay,StartHour,StartMinute,StartSecond}=Start,
+	{ts,FinishYear,FinishMonth,FinishDay,FinishHour,FinishMinute,FinishSecond}=Finish
 ) ->
-	case catch(gen_server:call(?MODULE,{check_file,SerieName,SeriePeriod,false},infinity)) of
-		{ok,FileName} ->
-			case catch(load_data(FileName,SeriePeriod,Start,Finish)) of
-				{ok,{matrix,Mat}} ->
-					{ok,{matrix,Mat}};
-				_ ->
-					{ok,{matrix,[[]]}}
-			end;
+	% Time1=erlang:timestamp(),
+    V1=calendar:datetime_to_gregorian_seconds({{StartYear,StartMonth,StartDay},{StartHour,StartMinute,StartSecond}}),
+    V2=calendar:datetime_to_gregorian_seconds({{FinishYear,FinishMonth,FinishDay},{FinishHour,FinishMinute,FinishSecond}}),
+	{Start1,Finish1}=case ((erlang:abs(V2-V1)>(86400*2)) and (SeriePeriod==1)) of
+		true ->
+			{{Yr,Mt,Dy},{Hr,Mn,Sc}}=calendar:gregorian_seconds_to_datetime(V2-86400*2),
+			{{ts,Yr,Mt,Dy,Hr,Mn,Sc},Finish};
+		false ->
+			{Start,Finish}
+	end,
+    case SerieName of
+		"test_sec" ->
+			Data=gen_sample_data(Start,Finish,1),
+			{ok,{m,Data}};
+		"test_min" ->
+			Data=gen_sample_data(Start,Finish,60),
+			{ok,{m,Data}};
+		"test_year" ->
+			Data=gen_sample_data(Start,Finish,86400),
+			{ok,{m,Data}};
 		_ ->
-			{ok,{matrix,[[]]}}
+			case catch(check_file(SerieName,SeriePeriod,false)) of
+				{ok,FileName} ->
+					case catch(load_data(FileName,SeriePeriod,align_timestamp(Start1,SeriePeriod),align_timestamp(Finish1,SeriePeriod))) of
+						{'EXIT',_} ->
+							{ok,{m,[[]]}};
+						{ok,{m,Mat}} ->
+							{ok,{m,Mat}};
+						_Other ->
+							io:format("tss: load: ~p error:~n~p~n",[{SerieName,SeriePeriod,Start,Finish},_Other]),
+							{ok,{m,[[]]}}
+					end;
+				_-> {ok,{m,[[]]}}
+			end
 	end;
 load(_,_,_,_) ->
-	{ok,{matrix,[[]]}}.
+	{ok,{m,[[]]}}.
 
+load_many(
+	{m,SeriesNamesValues},
+	SeriePeriod,
+	{ts,StartYear,StartMonth,StartDay,StartHour,StartMinute,StartSecond}=Start,
+	{ts,FinishYear,FinishMonth,FinishDay,FinishHour,FinishMinute,FinishSecond}=Finish
+) ->
+	V1=calendar:datetime_to_gregorian_seconds({{StartYear,StartMonth,StartDay},{StartHour,StartMinute,StartSecond}}),
+    V2=calendar:datetime_to_gregorian_seconds({{FinishYear,FinishMonth,FinishDay},{FinishHour,FinishMinute,FinishSecond}}),
+	{Start1,Finish1}=case ((erlang:abs(V2-V1)>86400) and (SeriePeriod==1)) of
+		true ->
+			{{Yr,Mt,Dy},{Hr,Mn,Sc}}=calendar:gregorian_seconds_to_datetime(V2-86400),
+			{{ts,Yr,Mt,Dy,Hr,Mn,Sc},Finish};
+		false ->
+			{Start,Finish}
+	end,
+	MatValue=lists:foldr(
+		fun(SeriesNames,AccIn) ->
+			{m,Mat}=load_many_internal(SeriesNames,SeriePeriod,Start1,Finish1),
+			Mat++AccIn
+		end,
+		[],
+		SeriesNamesValues
+	),
+	{ok,{m,MatValue}};
+load_many(_,_,_,_) ->
+	{ok,{m,[[]]}}.
+
+load_many_internal(SeriesNames,SeriePeriod,Start1,Finish1) ->
+	CheckFiles=[catch(check_file(SerieName,SeriePeriod,false)) || SerieName <- SeriesNames],
+	AllFilesChecked=lists:all(fun({ok,_}) -> true; (_) -> false end,CheckFiles),
+	case AllFilesChecked of
+		true ->
+			FilesNames=[FileName || {ok,FileName} <- CheckFiles],
+			case catch(load_data_many(FilesNames,SeriePeriod,align_timestamp(Start1,SeriePeriod),align_timestamp(Finish1,SeriePeriod))) of
+				{ok,{m,Mat}} ->
+					{m,Mat};
+				_Error ->
+					io:format("tss: load_many_internal: ~p~nerror: ~p~n",[{SeriesNames,SeriePeriod,Start1,Finish1},_Error]),
+					{m,[[]]}
+			end;
+		_ ->
+			{m,[[]]}
+	end.
+
+
+% calculate_size(SerieName,SeriePeriod) when is_list(SerieName),is_integer(SeriePeriod) ->
+%     case SerieName of
+% 		"test_sec" ->
+% 			{ok,0};
+% 		"test_min" ->
+% 			{ok,0};
+% 		"test_year" ->
+% 			{ok,0};
+% 		_ ->
+% 			case catch(check_file(SerieName,SeriePeriod,false)) of
+% 				{ok,FileName} ->
+% 					case file:read_file_info(FileName) of
+% 						{ok,FileInfo} ->
+% 							{ok,FileInfo#file_info.size};
+% 						_ ->
+% 							{ok,0}
+% 					end;
+% 				_ ->
+% 					{ok,0}
+% 			end
+% 	end;
+% calculate_size(_,_) ->
+% 	{ok,0}.
+
+export(SerieName,SeriePeriod,PathToFiles) when is_list(SerieName),is_integer(SeriePeriod),is_list(PathToFiles) ->
+    case SerieName of
+		"test_sec" ->
+			{ok,0};
+		"test_min" ->
+			{ok,0};
+		"test_year" ->
+			{ok,0};
+		_ ->
+			case catch(check_file(SerieName,SeriePeriod,false)) of
+				{ok,SrcFileName} ->
+					DstFileName=lists:flatten(
+						[
+							PathToFiles,
+							"/",
+							?dataDir,
+							"/",
+							get_dir_file_prefix(SerieName,SeriePeriod),
+							".serie"
+						]
+					),
+				    ok=filelib:ensure_dir(DstFileName),
+					{ok,BytesCopied}=file:copy(SrcFileName,DstFileName),
+					{ok,BytesCopied};
+				_ ->
+					{ok,0}
+			end
+	end;
+export(_,_,_) ->
+	{ok,0}.
+
+
+export_to_csv(SerieName,SeriePeriod,PathToFiles) when is_list(SerieName),is_integer(SeriePeriod),is_list(PathToFiles) ->
+    case SerieName of
+		"test_sec" ->
+			{ok,0};
+		"test_min" ->
+			{ok,0};
+		"test_year" ->
+			{ok,0};
+		_ ->
+			{ok,TS1}=get_first_timestamp(SerieName,SeriePeriod),
+			{ok,TS2}=get_last_timestamp(SerieName,SeriePeriod),
+			ExportFileName=lists:flatten(
+				[
+					PathToFiles,
+					"/",
+					?dataDir,
+					"/",
+					get_dir_file_prefix(SerieName,SeriePeriod),
+					".txt"
+				]
+			),
+			io:format("~w, ~s~n~w, ~w~n~ts~n",[SeriePeriod,SerieName,TS1,TS2,lists:flatten(["\"",ExportFileName,"\""])]),
+    		ok=filelib:ensure_dir(ExportFileName),
+    		{ok,File}=file:open(
+    			ExportFileName,
+    			[raw,write,binary,{delayed_write,50000000,600000}]
+    		),
+			Header=list_to_binary(
+				[
+					io_lib:format("~w.~n",[{header,SerieName,SeriePeriod,TS1,TS2}])
+				]
+			),
+			ok=file:write(File,Header),
+			process_export_serie(File,SerieName,SeriePeriod,TS1,TS2),
+			ok=file:close(File),
+			Cmd=lists:flatten(
+				[
+					"7z a -t7z -mx=1 \"",
+					filename:dirname(ExportFileName),
+					"/",
+					filename:basename(ExportFileName,".txt"),
+					".7z\" \"",
+					ExportFileName,
+					"\""
+				]
+			),
+			io:format("~s~n",[Cmd]),
+			CmdRes=os:cmd(Cmd),
+			io:format("~s~n",[CmdRes]),
+			ok=file:delete(ExportFileName),
+			garbage_collect(),
+			{ok,0}
+	end;
+export_to_csv(_,_,_) ->
+	{ok,0}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% @spec ({s,SerieName},{i,SeriePeriod}) -> {ok,Status}
+%% @spec (SerieName,SeriePeriod) -> {ok,Status}
 %% @doc Функция удаления серии SerieName с периодом SeriePeriod.
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-delete({s,SerieName},{i,SeriePeriod}) ->
+delete(SerieName,SeriePeriod) when is_list(SerieName),is_integer(SeriePeriod) ->
 	(catch gen_server:call(?MODULE,{delete,SerieName,SeriePeriod},infinity)),
-	{ok,{s,"Deleted."}};
+	{ok,"Deleted."};
 delete(_,_) ->
-	{ok,{s,"Deleted."}}.
+	{ok,"Deleted."}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% @spec () -> {ok,{matrix,Series}}
+%% @spec () -> {ok,{m,Series}}
 %% @doc Функция получения списка серий.
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 list_series() ->
 	{ok,Series}=gen_server:call(?MODULE,list_series,infinity),
-	{ok,{matrix,Series}}.
+	{ok,{m,Series}}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% @spec (Ticker) -> {ok,Timestamp}
@@ -139,16 +318,16 @@ list_series() ->
 get_last_tick_timestamp({ticker,Ticker}) ->
     TS=ts_now(),
     SerieName=lists:flatten([Ticker,".PRICE"]),
-    get_last_tick_timestamp({s,SerieName},TS,add_seconds(TS,-86400*31)).
+    get_last_tick_timestamp(SerieName,TS,add_seconds(TS,-86400*31)).
 
 get_last_tick_timestamp(SerieName,TS,FinishTS) ->
     case gt(TS,FinishTS) of
         true ->
             {ts,Year,Month,Day,_,_,_}=TS,
-            case load(SerieName,{i,60},{ts,Year,Month,Day,0,0,0},{ts,Year,Month,Day,23,59,59}) of
-                {ok,{matrix,[[]]}} ->
+            case load(SerieName,60,{ts,Year,Month,Day,0,0,0},{ts,Year,Month,Day,23,59,59}) of
+                {ok,{m,[[]]}} ->
                     get_last_tick_timestamp(SerieName,add_seconds({ts,Year,Month,Day,0,0,0},-86400),FinishTS);
-                {ok,{matrix,Data}} ->
+                {ok,{m,Data}} ->
                     [[LastTimestamp,_]|_]=lists:reverse(Data),
                     {ok,LastTimestamp};
                 _Other ->
@@ -159,10 +338,8 @@ get_last_tick_timestamp(SerieName,TS,FinishTS) ->
             {ok,FinishTS}
     end.
 
-get_last_timestamp(
-	{s,SerieName},
-	{i,SeriePeriod}) ->
-	case catch(gen_server:call(?MODULE,{check_file,SerieName,SeriePeriod,false},infinity)) of
+get_last_timestamp(SerieName,SeriePeriod) when is_list(SerieName),is_integer(SeriePeriod) ->
+	case catch(check_file(SerieName,SeriePeriod,false)) of
 		{ok,FileName} ->
 			case catch(find_last_timestamp(FileName,SerieName,SeriePeriod)) of
 				{ok,{ts,Year,Month,Day,Hour,Minute,Second}} ->
@@ -176,10 +353,8 @@ get_last_timestamp(
 get_last_timestamp(_,_) ->
 	{ok,{ts,1970,1,1,0,0,0}}.
 
-get_first_timestamp(
-	{s,SerieName},
-	{i,SeriePeriod}) ->
-	case catch(gen_server:call(?MODULE,{check_file,SerieName,SeriePeriod,false},infinity)) of
+get_first_timestamp(SerieName,SeriePeriod) when is_list(SerieName),is_integer(SeriePeriod) ->
+	case catch(check_file(SerieName,SeriePeriod,false)) of
 		{ok,FileName} ->
 			case catch(find_first_timestamp(FileName,SerieName,SeriePeriod)) of
 				{ok,{ts,Year,Month,Day,Hour,Minute,Second}} ->
@@ -217,9 +392,9 @@ find_first_timestamp(FileName,SerieName,SeriePeriod) ->
 	
 find_finish(File,SerieName,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod>=86400 ->
 	{ok,Year,_YearIndex}=get_last_year(File,SeriePeriod,2099),
-	{ok,{matrix,YearData}}=load(
-		{s,SerieName},
-		{i,SeriePeriod},
+	{ok,{m,YearData}}=load(
+		SerieName,
+		SeriePeriod,
 		{ts,Year,1,1,0,0,0},
 		{ts,Year,12,31,23,59,59}
 	),
@@ -231,9 +406,9 @@ find_finish(File,SerieName,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod
 	{_,Month,Day}=calendar:gregorian_days_to_date(
 		calendar:date_to_gregorian_days(Year,1,1)+DayPos
 	),
-	{ok,{matrix,DayData}}=load(
-		{s,SerieName},
-		{i,SeriePeriod},
+	{ok,{m,DayData}}=load(
+		SerieName,
+		SeriePeriod,
 		{ts,Year,Month,Day,0,0,0},
 		{ts,Year,Month,Day,23,59,59}
 	),
@@ -242,9 +417,9 @@ find_finish(File,SerieName,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod
 
 find_start(File,SerieName,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod>=86400 ->
 	{ok,Year,_YearIndex}=get_first_year(File,SeriePeriod,1900),
-	{ok,{matrix,YearData}}=load(
-		{s,SerieName},
-		{i,SeriePeriod},
+	{ok,{m,YearData}}=load(
+		SerieName,
+		SeriePeriod,
 		{ts,Year,1,1,0,0,0},
 		{ts,Year,12,31,23,59,59}
 	),
@@ -256,9 +431,9 @@ find_start(File,SerieName,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod<
 	{_,Month,Day}=calendar:gregorian_days_to_date(
 		calendar:date_to_gregorian_days(Year,1,1)+DayPos
 	),
-	{ok,{matrix,DayData}}=load(
-		{s,SerieName},
-		{i,SeriePeriod},
+	{ok,{m,DayData}}=load(
+		SerieName,
+		SeriePeriod,
 		{ts,Year,Month,Day,0,0,0},
 		{ts,Year,Month,Day,23,59,59}
 	),
@@ -351,9 +526,9 @@ store_series(Series) ->
 			SerieData=gb_sets:to_list(Serie),
 			SerieMatrix=case SerieData of
 				[] ->
-					{matrix,[[]]};
+					{m,[[]]};
 				_ ->
-					{matrix,SerieData}
+					{m,SerieData}
 			end,
 			store(SerieName,SeriePeriod,SerieMatrix)
 		end,
@@ -373,9 +548,9 @@ store_series_parallel(Series) ->
 			SerieData=gb_sets:to_list(Serie),
 			SerieMatrix=case SerieData of
 				[] ->
-					{matrix,[[]]};
+					{m,[[]]};
 				_ ->
-					{matrix,SerieData}
+					{m,SerieData}
 			end,
 			store(SerieName,SeriePeriod,SerieMatrix)
 		end,
@@ -405,21 +580,45 @@ start_link() ->
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 init(_Options) ->
-	CheckedPathToFiles=get_path_to_files(),
+	Config=fex_main:get_properties("tss.conf"),
+    io:format("tss: Config=~p~n",[Config]),
+	PathToFiles=proplists:get_value(path_to_files,Config,""),
+	
+    io:format("tss: PathToFiles=~p~n",[PathToFiles]),
+	L=length(PathToFiles),
+	CheckedPathToFiles=case string:sub_string(PathToFiles,L-1,L) of
+		"/" ->
+			string:sub_string(PathToFiles,1,L-1);
+		_ ->
+			PathToFiles
+	end,
+	io:format("tss: CheckedPathToFiles=~p~n",[CheckedPathToFiles]),
 	SeriesNamesFileName=lists:flatten([CheckedPathToFiles,"/",?seriesNamesFileName]),
+	io:format("tss: SeriesNamesFileName=~p~n",[SeriesNamesFileName]),
 	ok=filelib:ensure_dir(SeriesNamesFileName),
+	io:format("tss: filelib:ensure_dir(SeriesNamesFileName)~n",[]),
 	SeriesNames=case file:read_file(SeriesNamesFileName) of
 		{ok,Bin} ->
-			erlang:binary_to_term(Bin);
+			case catch(erlang:binary_to_term(Bin)) of
+				{'EXIT',_} ->
+					  gb_sets:empty();
+				Res ->
+					Res
+			end;
 		_ ->
 			gb_sets:empty()
 	end,
+	application:set_env(fex,tss_path_to_files,CheckedPathToFiles),
 	State=#config{
 		path_to_files=CheckedPathToFiles,
 		names=SeriesNames
 	},
 	garbage_collect(),
     {ok, State}.
+
+
+
+
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%
@@ -459,7 +658,7 @@ handle_call({check_file,SerieName,SeriePeriod,DoCreate}, _From, State) ->
 	{Reply,NewState}=case Res of
 		{ok,CheckedFileName} ->
 			Names=State#config.names,
-			Key=[{s,SerieName},{i,SeriePeriod}],
+			Key=[SerieName,SeriePeriod],
 			case gb_sets:is_member(Key,Names) of
 				true ->
 					{{ok,CheckedFileName},State};
@@ -494,6 +693,7 @@ handle_call({delete,SerieName,SeriePeriod}, _From, State) ->
 		]
 	),
 	file:delete(FileName),
+	io:format("~ts",[FileName]),
 	SecondDir=filename:dirname(FileName),
 	SecondLevel=lists:flatten(
 		[
@@ -521,7 +721,7 @@ handle_call({delete,SerieName,SeriePeriod}, _From, State) ->
 			ok
 	end,	
 	Names=State#config.names,
-	Key=[{s,SerieName},{i,SeriePeriod}],
+	Key=[SerieName,SeriePeriod],
 	NewNames=gb_sets:delete_any(Key,Names),
 	Bin=erlang:term_to_binary(NewNames),
 	SeriesNamesFileName=lists:flatten([State#config.path_to_files,"/",?seriesNamesFileName]),
@@ -538,7 +738,7 @@ handle_call({delete,SerieName,SeriePeriod}, _From, State) ->
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 handle_call(list_series, _From, State) ->
-	Reply={ok,gb_sets:to_list(State#config.names)},
+	Reply={ok,[["test_sec",1],["test_min",60],["test_year",86400]]++gb_sets:to_list(State#config.names)},
     {reply, Reply, State};
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -598,7 +798,7 @@ handle_info(_Info, State) ->
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 terminate(_Reason, _State) ->
-    ok.
+    normal.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% @hidden
@@ -608,7 +808,6 @@ terminate(_Reason, _State) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
-
         
 %%%%%%%%%%%%%%%%%%%%%%%
 %%% private функции %%%
@@ -619,6 +818,34 @@ code_change(_OldVsn, State, _Extra) ->
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
+check_file(SerieName,SeriePeriod,DoCreate) ->
+	% T1=erlang:timestamp(),
+	{ok,PathToFiles}=application:get_env(fex,tss_path_to_files),
+	FileName=lists:flatten(
+		[
+			PathToFiles,
+			"/",
+			?dataDir,
+			"/",
+			get_dir_file_prefix(SerieName,SeriePeriod),
+			".serie"
+		]
+	),
+	Res=case file:read_file_info(FileName) of
+		{ok,FileInfo} ->
+			case (FileInfo#file_info.size>=(?freeSpaceRefSize+?seriePeriodSize+?serieNameSize+?indexSize)) of
+				true ->
+					{ok,FileName};
+				false ->
+					catch(gen_server:call(?MODULE,{check_file,SerieName,SeriePeriod,DoCreate},infinity))
+			end;
+		_ ->
+			catch(gen_server:call(?MODULE,{check_file,SerieName,SeriePeriod,DoCreate},infinity))
+	end,
+	% T2=erlang:timestamp(),
+	% io:format("check_file: ~w~n",[timer:now_diff(T2,T1)]),
+	Res.
+	
 do_create_file(_SerieName,_SeriePeriod,_FileName,false) ->
 	{error,not_created};
 do_create_file(SerieName,SeriePeriod,FileName,true) ->
@@ -689,10 +916,23 @@ write_value(File,SeriePeriod,BlockIndex,{ts,_Year,_Month,_Day,_Hour,_Minute,_Sec
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 load_data(FileName,SeriePeriod,Start,Finish) ->
 	{ok,File}=file:open(FileName,[read,raw,binary,{read_ahead,86400*8}]),
-	Result=process_read_data(File,SeriePeriod,Start,Finish,m_arr:m()),
+	Result=process_read_data(File,SeriePeriod,Start,Finish,[]),
 	ok=file:close(File),
 	Result.
 	
+load_data_many(FilesNames,SeriePeriod,Start,Finish) ->
+	Files=[
+		begin
+			{ok,File}=file:open(FileName,[read,raw,binary,{read_ahead,86400*8}]),
+			File
+		end || FileName <- FilesNames],
+	Result=process_read_data_many(Files,SeriePeriod,Start,Finish,[]),
+	[
+		begin
+			ok=file:close(File)
+		end || File <- Files],
+	Result.
+
 process_read_data(File,SeriePeriod,Start,Finish,AccIn) ->
 	case lte(Start,Finish) of
 		true ->
@@ -706,18 +946,52 @@ process_read_data(File,SeriePeriod,Start,Finish,AccIn) ->
 			end,
 			NewAccIn=case get_index(File,SeriePeriod,Left,false) of
 				{value,BlockIndex} ->
-					process_read_values(File,SeriePeriod,BlockIndex,Left,Right,AccIn);
+					case catch(process_read_values(File,SeriePeriod,BlockIndex,Left,Right,AccIn)) of
+						{'EXIT',_Error} ->
+							io:format("tss: process_read_data: ~p~n~p~n",[{SeriePeriod,Start,Finish},_Error]),
+							AccIn;
+						Result ->
+							Result
+					end;
 				none ->
 					AccIn
 			end,
 			process_read_data(File,SeriePeriod,Next,Finish,NewAccIn);
 		false ->
-			Mat=m_arr:to_res(
-				AccIn,
-				fun(Cell) ->
-					Cell
-				end
+			Mat={m,lists:reverse(AccIn)},
+			{ok,Mat}
+	end.
+
+process_read_data_many(Files,SeriePeriod,Start,Finish,AccIn) ->
+	case lte(Start,Finish) of
+		true ->
+			Left=Start,
+			Next=get_period_next(Start,SeriePeriod),
+			Right=case lt(Finish,Next) of
+				true ->
+					Finish;
+				false ->
+					get_period_finish(Start,SeriePeriod)
+			end,
+			Offset=get_value_offset(Left,SeriePeriod),
+			Quantity=get_value_offset(Right,SeriePeriod)-Offset+8,
+			EmptyBin=?emptyBlock(Quantity div 8),
+			Bins=lists:map(
+				fun(File) ->
+					case get_index(File,SeriePeriod,Left,false) of
+						{value,BlockIndex} ->
+							{ok,Bin}=file:pread(File,BlockIndex+Offset,Quantity),
+							Bin;
+						none ->
+							EmptyBin
+					end
+				end,
+				Files
 			),
+			NewAccIn=process_binary_read_values_many(Left,SeriePeriod,Bins,AccIn),
+			process_read_data_many(Files,SeriePeriod,Next,Finish,NewAccIn);
+		false ->
+			Mat={m,lists:reverse(AccIn)},
 			{ok,Mat}
 	end.
 
@@ -725,23 +999,40 @@ process_read_values(File,SeriePeriod,BlockIndex,Left,Right,AccIn) ->
 	Offset=get_value_offset(Left,SeriePeriod),
 	Quantity=get_value_offset(Right,SeriePeriod)-Offset+8,
 	{ok,Bin}=file:pread(File,BlockIndex+Offset,Quantity),
-	process_binary_read_values(Left,SeriePeriod,Bin,AccIn).
-	
+	Result=process_binary_read_values(Left,SeriePeriod,Bin,AccIn),
+	Result.
+
 process_binary_read_values(Timestamp,SeriePeriod,Bin,AccIn) when byte_size(Bin)>0 ->
-    {<<ReadValue:8/little-float-unit:8>>,Tail}=erlang:split_binary(Bin,8),
-    NewAccIn=case convert_read_value(ReadValue) of
-    	empty ->
-    		AccIn;
-    	Value ->
-    		Row=m_arr:m_rows(AccIn)+1,
-    		M1=m_arr:m(AccIn,Row,1,Timestamp),
-    		M2=m_arr:m(M1,Row,2,{f,Value}),
-    		M2
-    end,
-    NewTimestamp=get_next_timestamp(Timestamp,SeriePeriod),
-    process_binary_read_values(NewTimestamp,SeriePeriod,Tail,NewAccIn);
+	{<<ReadValue:8/little-float-unit:8>>,Tail}=erlang:split_binary(Bin,8),
+    NewAccIn=convert_read_value(ReadValue,Timestamp,AccIn),
+	NewTimestamp=get_next_timestamp(Timestamp,SeriePeriod),
+	process_binary_read_values(NewTimestamp,SeriePeriod,Tail,NewAccIn);
 process_binary_read_values(_Timestamp,_SeriePeriod,Bin,AccIn) when byte_size(Bin)=<0 ->
 	AccIn.
+	
+process_binary_read_values_many(Timestamp,SeriePeriod,Bins,AccIn) ->
+    case lists:all(fun(Bin) -> byte_size(Bin)>0 end,Bins) of
+    	true ->
+    		ValuesAndTails=[
+    			begin
+	    			{<<ReadValue:8/little-float-unit:8>>,Tail}=erlang:split_binary(Bin,8),
+	    			Value=convert_read_value(ReadValue),
+	    			{Value,Tail}
+	    		end || Bin <- Bins
+
+    		],
+    		{Values,Tails}=lists:unzip(ValuesAndTails),
+    		NewAccIn=case lists:any(fun(undefined) -> true; (_) -> false end,Values) of
+    			true ->
+    				AccIn;
+    			false ->
+    				[[Timestamp|Values]|AccIn]
+    		end,
+			NewTimestamp=get_next_timestamp(Timestamp,SeriePeriod),
+			process_binary_read_values_many(NewTimestamp,SeriePeriod,Tails,NewAccIn);
+		false ->
+			AccIn
+	end.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -749,16 +1040,20 @@ process_binary_read_values(_Timestamp,_SeriePeriod,Bin,AccIn) when byte_size(Bin
 %% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 store_data(FileName,SeriePeriod,Data) ->
+	% T1=erlang:timestamp(),
 	ParsedData=parse_data(SeriePeriod,Data),
 	{ok,File}=file:open(FileName,[read,write,raw,binary,{read_ahead,86400*8}]),
 	ok=process_write_data(File,SeriePeriod,gb_trees:iterator(ParsedData)),
-	ok=file:close(File).
+	ok=file:close(File),
+	% T2=erlang:timestamp(),
+	% io:format("store_data: ~w~n",[timer:now_diff(T2,T1)]),
+	ok.
 
 parse_data(SeriePeriod,Data) when is_integer(SeriePeriod),SeriePeriod<86400 ->
 	lists:foldl(
 		fun(Row,AccIn) ->
 			case Row of
-				[{ts,Year,Month,Day,Hour,Minute,Second},{f,Value}] ->
+				[{ts,Year,Month,Day,Hour,Minute,Second},Value] ->
 					Entry=case gb_trees:lookup({ts,Year,Month,Day,0,0,0},AccIn) of
 						{value,TSEntry} ->
 							TSEntry;
@@ -776,7 +1071,7 @@ parse_data(SeriePeriod,Data) when is_integer(SeriePeriod),SeriePeriod<86400 ->
 	);
 parse_data(SeriePeriod,Data) when is_integer(SeriePeriod),SeriePeriod>=86400 ->
 	lists:foldl(
-		fun([{ts,Year,Month,Day,Hour,Minute,Second},{f,Value}],AccIn) ->
+		fun([{ts,Year,Month,Day,Hour,Minute,Second},Value],AccIn) ->
 			Entry=case gb_trees:lookup({ts,Year,1,1,0,0,0},AccIn) of
 				{value,TSEntry} ->
 					TSEntry;
@@ -889,13 +1184,22 @@ convert_write_value(Value) ->
 	Value.
 
 convert_read_value(?emptyValue) ->
-	empty;
+	undefined;
 convert_read_value(0.0) ->
-	empty;
+	undefined;
 convert_read_value(?zeroValue) ->
 	0.0;
 convert_read_value(Value) ->
 	Value.
+
+convert_read_value(?emptyValue,_Timestamp,AccIn) ->
+	AccIn;
+convert_read_value(0.0,_Timestamp,AccIn) ->
+	AccIn;
+convert_read_value(?zeroValue,Timestamp,AccIn) ->
+	[[Timestamp,0.0]|AccIn];
+convert_read_value(Value,Timestamp,AccIn) ->
+	[[Timestamp,Value]|AccIn].
 	
 empty_block(SeriePeriod) when is_integer(SeriePeriod),SeriePeriod<60 ->
 	?emptyBlock(86400);
@@ -948,7 +1252,14 @@ get_period_next({ts,Year,Month,Day,_Hour,_Minute,_Second}=_Start,SeriePeriod) wh
 	{ts,NewYear,NewMonth,NewDay,0,0,0};
 get_period_next({ts,Year,_Month,_Day,_Hour,_Minute,_Second}=_Start,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod>=86400 ->
 	{ts,Year+1,1,1,0,0,0}.
-	
+
+align_timestamp(Timestamp,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod<60 ->
+	Timestamp;
+align_timestamp({ts,Year,Month,Day,Hour,Minute,_Second}=_Timestamp,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod>=60,SeriePeriod<86400 ->
+	{ts,Year,Month,Day,Hour,Minute,0};
+align_timestamp({ts,Year,Month,Day,_Hour,_Minute,_Second}=_Timestamp,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod>=86400 ->
+	{ts,Year,Month,Day,0,0,0}.
+
 get_next_timestamp({ts,Year,Month,Day,Hour,Minute,Second}=_Timestamp,SeriePeriod) when is_integer(SeriePeriod),SeriePeriod<60 ->
 	Seconds=Hour*3600+Minute*60+Second+1,
 	NewHour=Seconds div 3600,
@@ -991,52 +1302,14 @@ next_day(Year,Month,Day) ->
 	end.
 
 ts_now() ->
-    {{Year,Month,Day},{Hour,Minute,Second}}=calendar:now_to_universal_time(now()),
-    TS={ts,Year,Month,Day,Hour,Minute,Second},
-    case is_dst(TS) of
-        false ->
-            add_seconds(TS,1*60*60);
-        true ->
-            add_seconds(TS,2*60*60)
-    end.
+	{{Year,Month,Day},{Hour,Minute,Second}}=localtime:utc_to_local(calendar:now_to_universal_time(erlang:timestamp()),"Europe/Berlin"),
+    {ts,Year,Month,Day,Hour,Minute,Second}.
 
 add_seconds({ts,Year,Month,Day,Hour,Minute,Second},Seconds) ->
 	V=calendar:datetime_to_gregorian_seconds({{Year,Month,Day},{Hour,Minute,Second}}),
     {{NewYear,NewMonth,NewDay}, {NewHour,NewMinute,NewSecond}} =
         calendar:gregorian_seconds_to_datetime(V+Seconds),
     {ts,NewYear,NewMonth,NewDay,NewHour,NewMinute,NewSecond}.
-
-is_dst({ts,Year,_Month,_Day,_Hour,_Minute,_Second}=TS) ->
-    {{M1,D1},{M2,D2}}=dst_period(Year),
-    TS1={ts,Year,M1,D1,0,0,0},
-    TS2={ts,Year,M2,D2,0,0,0},
-    lte(TS1,TS) and lt(TS,TS2);
-is_dst(_) ->
-    false.
-
-
-dst_period(1999) -> {{4,4},{10,31}};
-dst_period(2000) -> {{4,2},{10,29}};
-dst_period(2001) -> {{4,1},{10,28}};
-dst_period(2002) -> {{4,7},{10,27}};
-dst_period(2003) -> {{4,6},{10,26}};
-dst_period(2004) -> {{4,4},{10,31}};
-dst_period(2005) -> {{4,3},{10,30}};
-dst_period(2006) -> {{4,2},{10,29}};
-dst_period(2007) -> {{3,11},{11,4}};
-dst_period(2008) -> {{3,9},{11,2}};
-dst_period(2009) -> {{3,8},{11,1}};
-dst_period(2010) -> {{3,14},{11,7}};
-dst_period(2011) -> {{3,13},{11,6}};
-dst_period(2012) -> {{3,11},{11,4}};
-dst_period(2013) -> {{3,10},{11,3}};
-dst_period(2014) -> {{3,9},{11,2}};
-dst_period(2015) -> {{3,8},{11,1}};
-dst_period(2016) -> {{3,13},{11,6}};
-dst_period(2017) -> {{3,12},{11,5}};
-dst_period(2018) -> {{3,11},{11,4}};
-dst_period(2019) -> {{3,10},{11,3}};
-dst_period(_) -> {{3,10},{11,3}}.
 
 value2dec({ts,Year,Month,Day,Hour,Minute,Second}) ->
 	Year*10000000000+Month*100000000+Day*1000000+Hour*10000+Minute*100+Second;
@@ -1061,12 +1334,6 @@ comp(Value1,Value2,CompareFun) ->
 	V2=value2dec(Value2),
 	CompareFun(V1,V2).
 
-% eq(Timestamp1,Timestamp2) ->
-% 	comp(Timestamp1,Timestamp2,fun(A,B) -> A==B end).
-
-% neq(Timestamp1,Timestamp2) ->
-% 	comp(Timestamp1,Timestamp2,fun(A,B) -> A/=B end).
-	
 lt(Timestamp1,Timestamp2) ->
 	comp(Timestamp1,Timestamp2,fun(A,B) -> A<B end).
 
@@ -1076,99 +1343,22 @@ gt(Timestamp1,Timestamp2) ->
 lte(Timestamp1,Timestamp2) ->
 	comp(Timestamp1,Timestamp2,fun(A,B) -> A=<B end).
 
-% gte(Timestamp1,Timestamp2) ->
-% 	comp(Timestamp1,Timestamp2,fun(A,B) -> A>=B end).
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% @doc Функции для работы с файлом конфигурации.
-%% @end
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-get_path_to_files() ->
-	ConfigFilename=lists:flatten(
-        [
-            code:lib_dir(tss),
-            "/priv/config/",
-            "tss.conf"
-        ]
-    ),
-	ok=filelib:ensure_dir(ConfigFilename),
-	Config=case file:consult(ConfigFilename) of
-      {ok,Data} ->
-          Data;
-      _Other ->
-          []
-    end,
-	PathToFiles=proplists:get_value(path_to_files,Config,""),
-	L=length(PathToFiles),
-	case string:sub_string(PathToFiles,L-1,L) of
-		"/" ->
-			string:sub_string(PathToFiles,1,L-1);
-		_ ->
-			PathToFiles
-	end.
-
 %%%%%%%%%%%%%%%%%%%%
 %%% test функции %%%
 %%%%%%%%%%%%%%%%%%%%
 export_to_csv(Path) ->
-	{ok,{matrix,Series}}=list_series(),
+	{ok,{m,Series}}=list_series(),
 	FilteredSeries=lists:filter(
-		fun([{s,_Name},{i,Period}]) ->
-			(Period==86400)
-		end,
+		fun([Name,Period]) -> ((Period==60) and (string:str(Name,":CME")>0)) end,
 		Series
-	),	
+	),
 	io:format("Start time: ~p~n",[calendar:local_time()]),
 	io:format("FilteredSeries: ~p~n",[FilteredSeries]),
 	io:format("length(FilteredSeries): ~p~n",[length(FilteredSeries)]),
 	process_export(Path,FilteredSeries).
 
-process_export(Path,[[{s,SerieName},{i,SeriePeriod}]|Tail]) ->
-	case catch(gen_server:call(?MODULE,{check_file,SerieName,SeriePeriod,false},infinity)) of
-		{ok,FileName,".serie"} ->
-			{ok,TS1}=get_first_timestamp({s,SerieName},{i,SeriePeriod}),
-			{ok,TS2}=get_last_timestamp({s,SerieName},{i,SeriePeriod}),
-			ExportFileName=lists:flatten(
-				[
-					Path,
-					"/",
-					filename:basename(FileName,".serie"),
-					".txt"
-				]
-			),
-			io:format("~w, ~s~n~w, ~w~n~ts~n",[SeriePeriod,SerieName,TS1,TS2,lists:flatten(["\"",ExportFileName,"\""])]),
-    		ok=filelib:ensure_dir(ExportFileName),
-    		{ok,File}=file:open(
-    			ExportFileName,
-    			[raw,write,binary,{delayed_write,50000000,600000}]
-    		),
-			Header=list_to_binary(
-				[
-					io_lib:format("~w.~n",[{header,{s,SerieName},{i,SeriePeriod},TS1,TS2}])
-				]
-			),
-			ok=file:write(File,Header),
-			process_export_serie(File,SerieName,SeriePeriod,TS1,TS2),
-			ok=file:close(File),
-			Cmd=lists:flatten(
-				[
-					"7z a -t7z -mx=1 \"",
-					filename:dirname(ExportFileName),
-					"/",
-					filename:basename(ExportFileName,".txt"),
-					".7z\" \"",
-					ExportFileName,
-					"\""
-				]
-			),
-			io:format("~s~n",[Cmd]),
-			CmdRes=os:cmd(Cmd),
-			io:format("~s~n",[CmdRes]),
-			ok=file:delete(ExportFileName),
-			garbage_collect();
-		_ ->
-			ok
-	end,
+process_export(Path,[[SerieName,SeriePeriod]|Tail]) ->
+	export_to_csv(SerieName,SeriePeriod,Path),
 	process_export(Path,Tail);
 process_export(_Path,[]) ->
 	ok.
@@ -1180,44 +1370,46 @@ process_export_serie(File,SerieName,SeriePeriod,Start,Finish) ->
 			Right=get_period_finish(Start,SeriePeriod),
 			Next=get_period_next(Start,SeriePeriod),
 			io:format("~s, ~w, ~w, ~w~n",[SerieName,SeriePeriod,Left,Right]),
-			{ok,{matrix,Data}}=load({s,SerieName},{i,SeriePeriod},Left,Right),
-			file:write(File,list_to_binary(io_lib:format("~w.~n",[{matrix,Data}]))),
+			{ok,{m,Data}}=load(SerieName,SeriePeriod,Left,Right),
+			file:write(File,list_to_binary(io_lib:format("~w.~n",[{m,Data}]))),
 			process_export_serie(File,SerieName,SeriePeriod,Next,Finish);
 		false ->
 			ok
 	end.
+gen_sample_data(Start,Finish,Period) ->
+	StartTS=val(align_timestamp(Start,Period)),
+	FinishTS=val(align_timestamp(Finish,Period)),
+	gen_sample_data(StartTS,FinishTS,Period,Period*30,[]).
+
+gen_sample_data(StartTS,FinishTS,Step,Period,Acc) ->
+	case StartTS>FinishTS of
+		true ->
+			Acc;
+		false ->
+			TS=align_timestamp(ts(FinishTS),Step),
+			Phase=(FinishTS rem Period)/Period,
+			Value=1000*math:sin(2*math:pi()*Phase),
+			NewRow=[TS,Value],
+			NewAcc=[NewRow|Acc],
+			gen_sample_data(StartTS,FinishTS-Step,Step,Period,NewAcc)
+	end.
+
+val({ts,Year,Month,Day,Hour,Minute,Second}) ->
+	V1=calendar:datetime_to_gregorian_seconds({{Year,Month,Day},{Hour,Minute,Second}}),
+    V2=calendar:datetime_to_gregorian_seconds({{1970,1,1},{0,0,0}}),
+    V1-V2.
+
+ts(V) ->
+    Seconds = calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),
+    {{NewYear,NewMonth,NewDay}, {NewHour,NewMinute,NewSecond}} =
+        calendar:gregorian_seconds_to_datetime(Seconds+V),
+    {ts,NewYear,NewMonth,NewDay,NewHour,NewMinute,NewSecond}.
 
 -ifdef(TEST).
 
-test1_body() ->
-	?debugVal(file:get_cwd()),
-	ok=application:start(tss),
-	SerieName="TEST.PRICE",
-	SeriePeriod=60,
-	TS=ts_now(),
-	Data=[
-		[TS,{f,random:uniform()}]
-	],
-	{ok,_}=store(
-		{s,SerieName},
-		{i,SeriePeriod},
-		{matrix,Data}
-	),
-	Ticker={ticker,"TEST"},
-	?debugVal(timer:tc(?MODULE,get_last_tick_timestamp,[Ticker])),
-	{ts,Year,Month,Day,_,_,_}=TS,
-	{ok,{matrix,LoadedData}}=load(
-		{s,SerieName},
-		{i,SeriePeriod},
-		{ts,Year,Month,Day,0,0,0},
-		{ts,Year,Month,Day,23,59,59}
-	),
-	?debugVal(LoadedData),
-	ok=application:stop(tss).
+-include_lib("eunit/include/eunit.hrl").
 
-test1_test_() ->
-	[
-		{timeout,60000,fun test1_body/0}
-	].
+test_() ->
+	ok.
 
 -endif.
